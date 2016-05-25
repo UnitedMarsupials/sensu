@@ -583,62 +583,75 @@ module Sensu
       end
 
       aget "/aggregates/?" do
-        response = Array.new
-        settings.redis.smembers("aggregates") do |checks|
-          unless checks.empty?
-            checks.each_with_index do |check_name, index|
-              settings.redis.smembers("aggregates:#{check_name}") do |aggregates|
-                aggregates.reverse!
-                aggregates.map! do |issued|
-                  issued.to_i
+        settings.redis.smembers("aggregates") do |aggregates|
+          aggregates.map! do |aggregate|
+            {:name => aggregate}
+          end
+          body Sensu::JSON.dump(aggregates)
+        end
+      end
+
+      aget %r{^/aggregates/([\w\.-]+)/?$} do |aggregate|
+        response = {
+          :clients => 0,
+          :checks => 0,
+          :results => {
+            :ok => 0,
+            :warning => 0,
+            :critical => 0,
+            :unknown => 0,
+            :total => 0,
+            :stale => 0
+          }
+        }
+        settings.redis.smembers("aggregates:#{aggregate}") do |aggregate_members|
+          unless aggregate_members.empty?
+            clients = []
+            checks = []
+            results = []
+            aggregate_members.each_with_index do |member, index|
+              client_name, check_name = member.split(":")
+              clients << client_name
+              checks << check_name
+              result_key = "result:#{client_name}:#{check_name}"
+              settings.redis.get(result_key) do |result_json|
+                unless result_json.nil?
+                  results << Sensu::JSON.load(result_json)
+                else
+                  settings.redis.srem("aggregates:#{aggregate}", member)
                 end
-                item = {
-                  :check => check_name,
-                  :issued => aggregates
-                }
-                response << item
-                if index == checks.length - 1
+                if index == aggregate_members.length - 1
+                  response[:clients] = clients.uniq.length
+                  response[:checks] = checks.uniq.length
+                  max_age = integer_parameter(params[:max_age])
+                  if max_age
+                    result_count = results.length
+                    timestamp = Time.now.to_i - max_age
+                    results.reject! do |result|
+                      result[:executed] < timestamp
+                    end
+                    response[:results][:stale] = result_count - results.length
+                  end
+                  response[:results][:total] = results.length
+                  results.each do |result|
+                    severity = (SEVERITIES[result[:status]] || "unknown")
+                    response[:results][severity.to_sym] += 1
+                  end
                   body Sensu::JSON.dump(response)
                 end
               end
             end
-          else
-            body Sensu::JSON.dump(response)
-          end
-        end
-      end
-
-      aget %r{^/aggregates/([\w\.-]+)/?$} do |check_name|
-        settings.redis.smembers("aggregates:#{check_name}") do |aggregates|
-          unless aggregates.empty?
-            aggregates.reverse!
-            aggregates.map! do |issued|
-              issued.to_i
-            end
-            age = integer_parameter(params[:age])
-            if age
-              timestamp = Time.now.to_i - age
-              aggregates.reject! do |issued|
-                issued > timestamp
-              end
-            end
-            body Sensu::JSON.dump(pagination(aggregates))
           else
             not_found!
           end
         end
       end
 
-      adelete %r{^/aggregates/([\w\.-]+)/?$} do |check_name|
-        settings.redis.smembers("aggregates:#{check_name}") do |aggregates|
-          unless aggregates.empty?
-            aggregates.each do |check_issued|
-              result_set = "#{check_name}:#{check_issued}"
-              settings.redis.del("aggregation:#{result_set}")
-              settings.redis.del("aggregate:#{result_set}")
-            end
-            settings.redis.del("aggregates:#{check_name}") do
-              settings.redis.srem("aggregates", check_name) do
+      adelete %r{^/aggregates/([\w\.-]+)/?$} do |aggregate|
+        settings.redis.smembers("aggregates") do |aggregates|
+          if aggregates.include?(aggregate)
+            settings.redis.srem("aggregates", aggregate) do
+              settings.redis.del("aggregates:#{aggregate}") do
                 no_content!
               end
             end
@@ -648,37 +661,94 @@ module Sensu
         end
       end
 
-      aget %r{^/aggregates?/([\w\.-]+)/([\w\.-]+)/?$} do |check_name, check_issued|
-        result_set = "#{check_name}:#{check_issued}"
-        settings.redis.hgetall("aggregate:#{result_set}") do |aggregate|
-          unless aggregate.empty?
-            response = aggregate.inject(Hash.new) do |totals, (status, count)|
-              totals[status] = Integer(count)
-              totals
+      aget %r{^/aggregates/([\w\.-]+)/clients/?$} do |aggregate|
+        response = Array.new
+        settings.redis.smembers("aggregates:#{aggregate}") do |aggregate_members|
+          unless aggregate_members.empty?
+            clients = Hash.new
+            aggregate_members.each do |member|
+              client_name, check_name = member.split(":")
+              clients[client_name] ||= []
+              clients[client_name] << check_name
             end
-            settings.redis.hgetall("aggregation:#{result_set}") do |results|
-              parsed_results = results.inject(Array.new) do |parsed, (client_name, check_json)|
-                check = Sensu::JSON.load(check_json)
-                parsed << check.merge(:client => client_name)
-              end
-              if params[:summarize]
-                options = params[:summarize].split(",")
-                if options.include?("output")
-                  outputs = Hash.new(0)
-                  parsed_results.each do |result|
-                    outputs[result[:output]] += 1
-                  end
-                  response[:outputs] = outputs
-                end
-              end
-              if params[:results]
-                response[:results] = parsed_results
-              end
-              body Sensu::JSON.dump(response)
+            clients.each do |client_name, checks|
+              response << {
+                :name => client_name,
+                :checks => checks
+              }
             end
+            body Sensu::JSON.dump(response)
           else
             not_found!
           end
+        end
+      end
+
+      aget %r{^/aggregates/([\w\.-]+)/checks/?$} do |aggregate|
+        response = Array.new
+        settings.redis.smembers("aggregates:#{aggregate}") do |aggregate_members|
+          unless aggregate_members.empty?
+            checks = Hash.new
+            aggregate_members.each do |member|
+              client_name, check_name = member.split(":")
+              checks[check_name] ||= []
+              checks[check_name] << client_name
+            end
+            checks.each do |check_name, clients|
+              response << {
+                :name => check_name,
+                :clients => clients
+              }
+            end
+            body Sensu::JSON.dump(response)
+          else
+            not_found!
+          end
+        end
+      end
+
+      aget %r{^/aggregates/([\w\.-]+)/results/([\w\.-]+)/?$} do |aggregate, severity|
+        response = Array.new
+        if SEVERITIES.include?(severity)
+          settings.redis.smembers("aggregates:#{aggregate}") do |aggregate_members|
+            unless aggregate_members.empty?
+              summaries = Hash.new
+              max_age = integer_parameter(params[:max_age])
+              current_timestamp = Time.now.to_i
+              aggregate_members.each_with_index do |member, index|
+                client_name, check_name = member.split(":")
+                result_key = "result:#{client_name}:#{check_name}"
+                settings.redis.get(result_key) do |result_json|
+                  unless result_json.nil?
+                    result = Sensu::JSON.load(result_json)
+                    if SEVERITIES[result[:status]] == severity &&
+                        (max_age.nil? || result[:executed] >= (current_timestamp - max_age))
+                      summaries[check_name] ||= {}
+                      summaries[check_name][result[:output]] ||= {:total => 0, :clients => []}
+                      summaries[check_name][result[:output]][:total] += 1
+                      summaries[check_name][result[:output]][:clients] << client_name
+                    end
+                  end
+                  if index == aggregate_members.length - 1
+                    summaries.each do |check_name, outputs|
+                      summary = outputs.map do |output, output_summary|
+                        {:output => output}.merge(output_summary)
+                      end
+                      response << {
+                        :check => check_name,
+                        :summary => summary
+                      }
+                    end
+                    body Sensu::JSON.dump(response)
+                  end
+                end
+              end
+            else
+              not_found!
+            end
+          end
+        else
+          bad_request!
         end
       end
 
